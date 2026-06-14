@@ -430,6 +430,121 @@ def revision_prompt_for_mode(mode: str, custom: str) -> str:
         return base + "\nAdditional user instruction: " + custom.strip()
     return base
 
+
+# =============================================================================
+# Multi-user app login
+# =============================================================================
+def _configured_users() -> dict[str, str]:
+    """Read multiple users from Streamlit secrets or environment.
+
+    Preferred Streamlit secrets format:
+
+    [users]
+    haopeng = "password1"
+    editor = "password2"
+
+    Fallback for simple single-password deployments:
+    AUTH_USERNAME = "haopeng"
+    AUTH_PASSWORD = "password1"
+    """
+    users: dict[str, str] = {}
+
+    try:
+        raw_users = st.secrets.get("users", {})
+        if raw_users:
+            users = {
+                str(k).strip(): str(v)
+                for k, v in dict(raw_users).items()
+                if str(k).strip() and str(v)
+            }
+    except Exception:
+        users = {}
+
+    # Optional environment variable format:
+    # APP_USERS='{"haopeng":"password1","editor":"password2"}'
+    if not users:
+        raw_env_users = os.getenv("APP_USERS", "").strip()
+        if raw_env_users:
+            try:
+                parsed = json.loads(raw_env_users)
+                if isinstance(parsed, dict):
+                    users = {
+                        str(k).strip(): str(v)
+                        for k, v in parsed.items()
+                        if str(k).strip() and str(v)
+                    }
+            except Exception:
+                users = {}
+
+    # Backward-compatible single-user fallback.
+    if not users:
+        username = _read_secret_or_env("AUTH_USERNAME") or "user"
+        password = _read_secret_or_env("AUTH_PASSWORD")
+        if password:
+            users = {username: password}
+
+    return users
+
+
+def require_login() -> None:
+    """Protect the Streamlit app with username/password login for multiple users."""
+    users = _configured_users()
+
+    if not users:
+        st.warning(
+            "Login is enabled, but no users are configured. "
+            "Add a [users] table in Streamlit secrets before sharing the app."
+        )
+        with st.expander("Expected secrets format"):
+            st.code(
+                """[users]
+haopeng = "your-password"
+editor = "another-password"
+
+GEMINI_API_KEY = "your-gemini-key"
+BIGMODEL_API_KEY = "your-bigmodel-key"
+""",
+                language="toml",
+            )
+        return
+
+    if "auth_ok" not in st.session_state:
+        st.session_state.auth_ok = False
+    if "auth_user" not in st.session_state:
+        st.session_state.auth_user = ""
+
+    if st.session_state.auth_ok:
+        with st.sidebar:
+            st.caption(f"🔒 Logged in as {st.session_state.auth_user}")
+            if st.button("Log out", use_container_width=True):
+                st.session_state.auth_ok = False
+                st.session_state.auth_user = ""
+                st.rerun()
+        return
+
+    st.markdown("# 🔒 AI Novel Studio Login")
+    st.caption("Enter your username and password to continue.")
+
+    with st.form("login_form"):
+        entered_username = st.text_input("Username")
+        entered_password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in", use_container_width=True)
+
+    if submitted:
+        username = entered_username.strip()
+        expected_password = users.get(username)
+        if expected_password and entered_password == expected_password:
+            st.session_state.auth_ok = True
+            st.session_state.auth_user = username
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+
+    st.stop()
+
+
+require_login()
+
 # =============================================================================
 # Sidebar
 # =============================================================================
