@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import io
 import hashlib
+import hmac
 import json
 import os
 import re
 import time
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,6 +40,17 @@ st.markdown(
     .version-box { border-left: 4px solid #1D9E75; padding-left: 12px; margin: 8px 0; }
     .stProgress > div > div { background-color: #1D9E75; }
     div[data-testid="stSidebarContent"] { padding-top: 1.2rem; }
+    .mobile-card { border: 1px solid rgba(128,128,128,.25); border-radius: 14px; padding: 12px; margin: 8px 0 14px 0; background: rgba(128,128,128,.04); }
+    .mobile-kpi { font-size: 0.86rem; color: #666; margin-bottom: 0.25rem; }
+    .mobile-title { font-size: 1.1rem; font-weight: 700; margin-bottom: 0.35rem; }
+    @media (max-width: 760px) {
+        .block-container { padding-left: 0.85rem; padding-right: 0.85rem; padding-top: 0.85rem; }
+        .stage-header { font-size: 1.12rem; }
+        .stage-desc { font-size: 0.86rem; margin-bottom: 0.75rem; }
+        div[data-testid="stHorizontalBlock"] { gap: 0.35rem; }
+        textarea { font-size: 16px !important; }
+        input { font-size: 16px !important; }
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -91,6 +104,33 @@ def _extract_gemini_text(result: dict) -> str:
     raise RuntimeError(f"No text returned from Gemini: {json.dumps(result, ensure_ascii=False)[:800]}")
 
 
+class AIProviderError(RuntimeError):
+    """Provider error with enough metadata for smarter retry/fallback decisions."""
+
+    def __init__(self, message: str, *, status_code: int | None = None, retryable: bool = False, fatal: bool = False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.fatal = fatal
+
+
+def _provider_status(message: str) -> None:
+    """Best-effort status breadcrumb for the sidebar Last action box."""
+    try:
+        st.session_state["_last_action"] = message
+    except Exception:
+        pass
+
+
+def _gemini_error_from_http(exc: urllib.error.HTTPError, clean_model: str) -> AIProviderError:
+    error_body = exc.read().decode("utf-8", errors="ignore")
+    code = int(getattr(exc, "code", 0) or 0)
+    retryable = code == 429 or 500 <= code <= 599
+    fatal = code in {401, 403}
+    message = f"HTTP {code} for {clean_model}: {error_body[:800]}"
+    return AIProviderError(message, status_code=code, retryable=retryable, fatal=fatal)
+
+
 def _call_one_gemini_model(api_key: str, prompt: str, model_name: str, max_tokens: int) -> str:
     clean_model = model_name.replace("models/", "").strip()
     model = urllib.parse.quote(clean_model, safe="")
@@ -109,15 +149,21 @@ def _call_one_gemini_model(api_key: str, prompt: str, model_name: str, max_token
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    timeout_seconds = float(os.getenv("AI_PROVIDER_TIMEOUT_SECONDS", "60"))
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"HTTP {exc.code} for {clean_model}: {error_body[:800]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Network error calling Gemini API: {exc.reason}") from exc
-    return _extract_gemini_text(json.loads(body))
+        raise _gemini_error_from_http(exc, clean_model) from exc
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        raise AIProviderError(
+            f"Temporary network error calling Gemini {clean_model}: {exc}",
+            retryable=True,
+        ) from exc
+    try:
+        return _extract_gemini_text(json.loads(body))
+    except Exception as exc:
+        raise AIProviderError(f"Invalid Gemini response from {clean_model}: {exc}", retryable=False) from exc
 
 
 def list_generate_content_models(api_key: str) -> list[str]:
@@ -139,25 +185,55 @@ def list_generate_content_models(api_key: str) -> list[str]:
 
 
 def call_gemini_rest(api_key: str, prompt: str, max_tokens: int = 3000) -> str:
+    """Call Gemini with retry-aware fallback.
+
+    Retryable errors (429, 5xx, timeout/network) get 1-2 short backoff retries on
+    the same model. Non-retryable errors (bad request, model not found) switch to
+    the next model immediately. Auth errors stop Gemini attempts quickly so the
+    user does not wait through every fallback model.
+    """
     candidate_models: list[str] = []
     for m in GEMINI_FALLBACK_MODELS:
         clean = m.replace("models/", "").strip()
         if clean and clean not in candidate_models:
             candidate_models.append(clean)
-    errors = []
-    for model in candidate_models:
-        try:
-            return _call_one_gemini_model(api_key, prompt, model, max_tokens)
-        except Exception as exc:
-            errors.append(str(exc))
-    available = list_generate_content_models(api_key)
+
+    max_dynamic = int(os.getenv("GEMINI_DYNAMIC_MODEL_LIMIT", "3"))
+    available = list_generate_content_models(api_key)[:max_dynamic]
     for model in available:
-        if model not in candidate_models:
+        clean = model.replace("models/", "").strip()
+        if clean and clean not in candidate_models:
+            candidate_models.append(clean)
+
+    max_retries = int(os.getenv("AI_RETRYABLE_RETRIES", "2"))
+    base_delay = float(os.getenv("AI_RETRY_BASE_SECONDS", "1.5"))
+    errors: list[str] = []
+
+    for model in candidate_models:
+        attempt = 0
+        while True:
             try:
+                _provider_status(f"Calling Gemini {model} (attempt {attempt + 1})...")
                 return _call_one_gemini_model(api_key, prompt, model, max_tokens)
+            except AIProviderError as exc:
+                errors.append(str(exc))
+                if exc.fatal:
+                    raise RuntimeError("Gemini authentication/permission failed. Check API key or quota. " + str(exc)) from exc
+                if exc.retryable and attempt < max_retries:
+                    delay = min(base_delay * (2 ** attempt), 8.0)
+                    _provider_status(f"Gemini {model} temporary error; retry {attempt + 1}/{max_retries} after {delay:.1f}s")
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                # Non-retryable or retry budget exhausted: move to next model.
+                _provider_status(f"Switching Gemini model after error on {model}: {str(exc)[:180]}")
+                break
             except Exception as exc:
                 errors.append(str(exc))
-    raise RuntimeError("Could not call Gemini. Last errors: " + " | ".join(errors[-3:]))
+                _provider_status(f"Switching Gemini model after unexpected error on {model}: {str(exc)[:180]}")
+                break
+
+    raise RuntimeError("Could not call Gemini. Last errors: " + " | ".join(errors[-5:]))
 
 
 def _extract_openai_style_text(result: dict, provider: str) -> str:
@@ -207,6 +283,25 @@ IMPORTANT OUTPUT RULES:
 - Do not include labels such as "Genre Analysis", "Plot Archetype", "Critique", "Fix", "Note to user", or "Architect's Note".
 - Do not end with sales/chatbot follow-up questions like "Would you like me to...".
 - These rules are invisible instructions, not content. Never print them.
+""".strip()
+
+
+BACKEND_GLOBAL_STYLE_PROMPT = """
+GLOBAL FICTION STYLE RULES / 全局后台文风规则:
+- 使用白描。文笔细腻在线。
+- 依靠具体、客观、克制的细节、动作、大量对话、场景、感官描写来呈现一切。
+- 不进行主观解释，不进行心理分析，不替人物总结情绪。
+- 节奏舒缓但不拖沓。通过心理细节、语言、动作、环境推进情节。
+- 禁止使用排比句、对偶句、反复等修辞性排叠结构。
+- 禁止使用“不是……而是……”。
+- 禁止使用“既……又……”。
+- 禁止使用“即使……也……”。
+- 禁止使用“虽然……但是……”。
+- 禁止使用“不x，不y，不z，就”格式。
+- 禁止使用“这就够了”。
+- 禁止使用“很…，但很…”等总结性短判断。
+- 禁止使用任何以“不是”开头的否定句式。
+- 这些规则是后台写作约束，不要在输出中解释、复述或列出。
 """.strip()
 
 
@@ -479,7 +574,7 @@ def clean_story_bible_output(text: str, title: str = "") -> str:
 
 
 def call_ai(system: str, user: str, max_tokens: int = 3000) -> str:
-    prompt = f"{system.strip()}\n\n{OUTPUT_POLICY}\n\nUSER REQUEST:\n{user.strip()}"
+    prompt = f"{system.strip()}\n\n{BACKEND_GLOBAL_STYLE_PROMPT}\n\n{OUTPUT_POLICY}\n\nUSER REQUEST:\n{user.strip()}"
     gemini_key = get_gemini_api_key()
     bigmodel_key = get_bigmodel_api_key()
     errors = []
@@ -498,15 +593,35 @@ def call_ai(system: str, user: str, max_tokens: int = 3000) -> str:
     raise RuntimeError("AI providers failed. " + " | ".join(errors[-3:]))
 
 
-def generate_text(system: str, user: str, placeholder, max_tokens: int = 3000, cleaner=None) -> str:
+def generate_text(system: str, user: str, placeholder, max_tokens: int = 3000, cleaner=None, task_name: str = "AI generation") -> str:
+    """Call AI with basic generation locks and raw-output backup.
+
+    Streamlit runs top-to-bottom on every interaction. This wrapper protects the
+    app from losing long generations by saving raw and cleaned output to
+    session_state before rendering it in the placeholder.
+    """
+    if st.session_state.get("ai_running", False):
+        st.warning("AI is already generating. Please wait until the current task finishes.")
+        return ""
+    st.session_state.ai_running = True
+    st.session_state.ai_task_name = task_name
+    st.session_state.ai_started_at = datetime.now().isoformat(timespec="seconds")
     try:
-        text = call_ai(system, user, max_tokens=max_tokens)
-        text = clean_ai_output(text)
+        raw_text = call_ai(system, user, max_tokens=max_tokens)
+        st.session_state["_last_ai_raw_output"] = raw_text
+        st.session_state["_last_ai_task_name"] = task_name
+        st.session_state["_last_ai_raw_at"] = datetime.now().isoformat(timespec="seconds")
+        text = clean_ai_output(raw_text)
         if cleaner is not None:
             text = cleaner(text)
+        # Save cleaned output before drawing, so a UI refresh does not lose it.
+        st.session_state["_last_ai_clean_output"] = text
     except Exception as exc:
         st.error(f"AI call failed: {exc}")
         return ""
+    finally:
+        st.session_state.ai_running = False
+        st.session_state.ai_task_name = ""
     shown = ""
     for chunk in re.split(r"(\n\n+)", text):
         shown += chunk
@@ -572,6 +687,200 @@ for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+# =============================================================================
+# Stability helpers: dirty state, AI/save locks, login token
+# =============================================================================
+STABILITY_DEFAULTS = {
+    "ai_running": False,
+    "ai_task_name": "",
+    "ai_started_at": "",
+    "cloud_save_running": False,
+    "cloud_last_save_status": "idle",
+    "cloud_last_save_at": "",
+    "cloud_last_saved_hash": "",
+    "cloud_last_summary": "",
+    "project_dirty": False,
+    "pending_ai_results": {},
+    "batch_revision_proposals": {},
+    "cloud_snapshot_status": "",
+    "view_mode": "Auto",
+}
+for key, value in STABILITY_DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def mark_dirty() -> None:
+    st.session_state.project_dirty = True
+
+
+def _json_hash(data: object) -> str:
+    return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def current_project_hash() -> str:
+    return _json_hash(project_data())
+
+
+def mark_saved(stamp: str = "") -> None:
+    st.session_state.cloud_last_saved_hash = current_project_hash()
+    st.session_state.project_dirty = False
+    st.session_state.cloud_last_save_at = stamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.cloud_last_save_status = "success"
+
+
+def selected_value_is_valid(key: str, options: list, default):
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = default
+
+
+def selected_list_is_valid(key: str, options: list, default: list | None = None):
+    current = st.session_state.get(key, default or []) or []
+    st.session_state[key] = [x for x in current if x in options]
+    if not st.session_state[key] and default:
+        st.session_state[key] = [x for x in default if x in options]
+
+
+def auth_secret() -> str:
+    return (
+        _read_secret_or_env("AUTH_TOKEN_SECRET")
+        or _read_secret_or_env("SUPABASE_KEY")
+        or _read_secret_or_env("SUPABASE_ANON_KEY")
+        or "ai-novel-studio-local-dev-secret"
+    )
+
+
+def make_auth_token(username: str, days: int = 30) -> str:
+    exp = int(time.time()) + days * 86400
+    body = f"{username}:{exp}"
+    sig = hmac.new(auth_secret().encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{body}:{sig}"
+
+
+def verify_auth_token(token: str) -> str | None:
+    try:
+        username, exp_s, sig = token.split(":", 2)
+        if int(exp_s) < int(time.time()):
+            return None
+        body = f"{username}:{exp_s}"
+        expected = hmac.new(auth_secret().encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+        return username if hmac.compare_digest(sig, expected) else None
+    except Exception:
+        return None
+
+
+def restore_login_from_query_token() -> None:
+    if st.session_state.get("auth_ok"):
+        return
+    try:
+        token = st.query_params.get("auth", "")
+    except Exception:
+        token = ""
+    username = verify_auth_token(token) if token else None
+    if username:
+        st.session_state.auth_ok = True
+        st.session_state.auth_user = username
+
+
+def clear_login_query_token() -> None:
+    try:
+        if "auth" in st.query_params:
+            del st.query_params["auth"]
+    except Exception:
+        pass
+
+
+def render_status_bar() -> None:
+    user = st.session_state.get("auth_user", "") or "not logged in"
+    dirty = "Unsaved changes" if st.session_state.get("project_dirty") else "Saved"
+    ai = f"AI: {st.session_state.get('ai_task_name')}" if st.session_state.get("ai_running") else "AI: idle"
+    cloud = st.session_state.get("cloud_last_save_at") or "not saved this session"
+    st.caption(f"🔒 {user} | ☁️ {dirty} | Last save: {cloud} | {ai}")
+
+
+def story_bible_is_incomplete(text: str) -> bool:
+    if not text or len(text.strip()) < 1200:
+        return True
+    required = ["## 核心前提", "## 主要角色", "## 时间线", "## 必须避免"]
+    return not all(x in text for x in required)
+
+
+def render_formatted_outline() -> None:
+    chapters = st.session_state.get("chapters", []) or parse_chapters(st.session_state.get("outline", ""))
+    if not chapters:
+        st.info("还没有识别到章节。可以查看原始大纲，或把章节格式改成：第1章：标题 — 摘要。")
+        return
+    for ch in chapters:
+        num = ch.get("num", "")
+        title = ch.get("title", "未命名章节")
+        summary = ch.get("summary", "")
+        st.markdown(f"### 第{num}章：{title}")
+        st.markdown(summary or "_无摘要_")
+        st.divider()
+
+
+def normalize_widget_defaults() -> None:
+    selected_value_is_valid("language", ["Chinese 中文", "English", "Bilingual 中英双语"], "Chinese 中文")
+    selected_value_is_valid("audience_channel", ["女频", "男频", "通用/无固定频道"], "女频")
+    selected_value_is_valid("chinese_style", ["现代网文", "古风/仙侠", "女频仙侠", "玄幻升级流", "悬疑推理", "都市情感", "轻小说", "宫斗权谋", "中式恐怖", "文学感", "自定义"], "现代网文")
+    selected_value_is_valid("genre", ["Xianxia / 仙侠", "Wuxia / 武侠", "Fantasy", "Science Fiction", "Romance", "Thriller", "Mystery", "Historical Fiction", "Urban Fantasy / 都市异能", "Horror", "Literary Fiction", "Other"], "Xianxia / 仙侠")
+    selected_value_is_valid("target_length", ["Short story (~5 chapters)", "Novella (~10 chapters)", "Novel (~18 chapters)", "Long web novel (~30 chapters)"], "Novel (~18 chapters)")
+
+
+def normalize_cloud_widget_keys(key_prefix: str) -> None:
+    # Keep sidebar/setup cloud widgets synced with global settings.
+    auto_key = f"{key_prefix}_auto_save_enabled"
+    if auto_key in st.session_state:
+        st.session_state.cloud_auto_save_enabled = bool(st.session_state.get(auto_key))
+
+
+def default_cloud_project_name() -> str:
+    """Use Step 1 project name automatically for cloud save."""
+    name = st.session_state.get("project_name") or st.session_state.get("novel_title") or "Untitled"
+    return str(name).strip() or "Untitled"
+
+
+def normalize_project_name_from_cloud_widget(key_prefix: str) -> str:
+    save_as_key = f"{key_prefix}_save_as_name"
+    override = str(st.session_state.get(save_as_key, "") or "").strip()
+    return override or default_cloud_project_name()
+
+
+def cloud_project_updated_at(username: str, project_name: str) -> str:
+    try:
+        for item in cloud_list_projects(username):
+            if item.get("project_name") == project_name:
+                return str(item.get("updated_at") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+def cloud_save_project_guarded(username: str, project_name: str, force: bool = False, save_reason: str = "manual save") -> dict:
+    if st.session_state.get("ai_running"):
+        raise RuntimeError("AI is currently generating. Please wait before saving, so a partial/old result is not saved.")
+    if st.session_state.get("cloud_save_running"):
+        raise RuntimeError("Cloud save is already running.")
+    cloud_updated = cloud_project_updated_at(username, project_name)
+    last_local = st.session_state.get("cloud_last_save_at", "")
+    if cloud_updated and last_local and cloud_updated[:19].replace("T", " ") > last_local and not force:
+        raise RuntimeError("Cloud project changed after your last local save. Load cloud, save as a new project, or enable Force overwrite.")
+    st.session_state.cloud_save_running = True
+    st.session_state.cloud_last_save_status = "saving"
+    try:
+        saved = cloud_save_project(username, project_name)
+        try:
+            cloud_create_project_snapshot(username, project_name, save_reason=save_reason)
+            st.session_state.cloud_snapshot_status = "snapshot saved"
+        except Exception as snapshot_exc:
+            st.session_state.cloud_snapshot_status = f"snapshot skipped/failed: {snapshot_exc}"
+        updated = saved.get("updated_at", "") if isinstance(saved, dict) else ""
+        stamp = updated[:19].replace("T", " ") if updated else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        mark_saved(stamp)
+        return saved
+    finally:
+        st.session_state.cloud_save_running = False
+
 
 def normalize_loaded_project(data: dict) -> dict:
     normalized = dict(DEFAULTS)
@@ -586,7 +895,7 @@ def normalize_loaded_project(data: dict) -> dict:
 def project_data() -> dict:
     data = {field: st.session_state.get(field, DEFAULTS.get(field)) for field in PROJECT_FIELDS}
     data["saved_at"] = datetime.now().isoformat(timespec="seconds")
-    data["app_version"] = "novel-studio-project-v16-auto-cloud-save"
+    data["app_version"] = "novel-studio-project-v24-smart-retry-tests"
     return data
 
 
@@ -635,6 +944,7 @@ def load_project(data: dict) -> None:
 
     st.session_state["_json_repair_note"] = " ".join(p for p in note_parts if p).strip()
     rebuild_full_draft()
+    st.session_state.project_dirty = False
 
 
 def loaded_project_summary(data: dict | None = None) -> str:
@@ -773,6 +1083,52 @@ def cloud_delete_project(username: str, project_name: str) -> None:
     _supabase_request("DELETE", path)
 
 
+def cloud_create_project_snapshot(username: str, project_name: str, save_reason: str = "manual save") -> dict:
+    data = project_data()
+    payload = {
+        "username": username,
+        "project_name": project_name,
+        "novel_title": st.session_state.get("novel_title", project_name),
+        "current_stage": int(st.session_state.get("stage", 1) or 1),
+        "save_reason": save_reason,
+        "project_hash": _json_hash(data),
+        "project_data": data,
+    }
+    result = _supabase_request("POST", "novel_project_snapshots", payload, prefer="return=representation")
+    if isinstance(result, list) and result:
+        return result[0]
+    if isinstance(result, dict):
+        return result
+    return payload
+
+
+def cloud_list_project_snapshots(username: str, project_name: str, limit: int = 30) -> list[dict]:
+    user_filter = urllib.parse.quote(username, safe="")
+    project_filter = urllib.parse.quote(project_name, safe="")
+    path = (
+        "novel_project_snapshots"
+        "?select=id,username,project_name,novel_title,current_stage,save_reason,project_hash,saved_at"
+        f"&username=eq.{user_filter}"
+        f"&project_name=eq.{project_filter}"
+        "&order=saved_at.desc"
+        f"&limit={int(limit)}"
+    )
+    result = _supabase_request("GET", path)
+    return result if isinstance(result, list) else []
+
+
+def cloud_load_project_snapshot(snapshot_id: str) -> dict:
+    snap_filter = urllib.parse.quote(str(snapshot_id), safe="")
+    path = f"novel_project_snapshots?select=project_data&id=eq.{snap_filter}&limit=1"
+    result = _supabase_request("GET", path)
+    if not isinstance(result, list) or not result:
+        raise RuntimeError("Snapshot not found.")
+    data = result[0].get("project_data")
+    if not isinstance(data, dict):
+        raise RuntimeError("Snapshot exists, but project_data is missing or invalid.")
+    return data
+
+
 def cloud_auto_save(reason: str = "project update") -> bool:
     """Auto-save current project after meaningful generation events.
 
@@ -781,23 +1137,19 @@ def cloud_auto_save(reason: str = "project update") -> bool:
     """
     if not st.session_state.get("cloud_auto_save_enabled", False):
         return False
+    if st.session_state.get("ai_running"):
+        st.session_state.cloud_last_summary = "Auto-save skipped while AI is generating."
+        return False
     if not cloud_enabled():
         st.session_state.cloud_last_summary = "Auto-save skipped: Supabase is not configured."
         return False
     username = st.session_state.get("auth_user", "user") or "user"
-    project_name = (
-        st.session_state.get("cloud_project_name_input")
-        or st.session_state.get("project_name")
-        or st.session_state.get("novel_title")
-        or "Untitled"
-    )
+    project_name = default_cloud_project_name()
     try:
-        saved = cloud_save_project(username, project_name)
+        saved = cloud_save_project_guarded(username, project_name, force=True, save_reason=f"auto-save: {reason}")
         updated = saved.get("updated_at", "") if isinstance(saved, dict) else ""
-        stamp = updated[:19].replace("T", " ") if updated else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stamp = updated[:19].replace("T", " ") if updated else st.session_state.get("cloud_last_save_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         st.session_state.cloud_last_summary = f"Auto-saved '{project_name}' after {reason}. Last save: {stamp}"
-        st.session_state.cloud_last_save_at = stamp
-        st.session_state.cloud_last_save_status = "success"
         st.session_state["_last_action"] = st.session_state.cloud_last_summary
         try:
             st.toast("Auto-saved to cloud")
@@ -823,33 +1175,47 @@ def render_cloud_projects_panel(key_prefix: str = "cloud") -> None:
             )
             return
 
-        cloud_name = st.text_input(
-            "Cloud project name",
-            value=st.session_state.get("project_name", st.session_state.get("novel_title", "Untitled")),
-            key=f"{key_prefix}_project_name_input",
-        )
+        auto_cloud_name = default_cloud_project_name()
+        st.caption(f"Cloud project name is auto-filled from Step 1: **{auto_cloud_name}**")
+        with st.expander("Save as new copy / 另存为新项目", expanded=False):
+            st.text_input(
+                "Optional new cloud project name",
+                key=f"{key_prefix}_save_as_name",
+                placeholder="Leave blank to use the Step 1 project file name",
+            )
+            st.caption("Leave blank for normal Save to cloud. Fill only when you intentionally want a new cloud copy.")
+        if f"{key_prefix}_auto_save_enabled" not in st.session_state:
+            st.session_state[f"{key_prefix}_auto_save_enabled"] = st.session_state.get("cloud_auto_save_enabled", False)
         st.checkbox(
             "Auto-save after generation / 生成后自动云保存",
-            value=st.session_state.get("cloud_auto_save_enabled", False),
             key=f"{key_prefix}_auto_save_enabled",
             help="Only auto-saves after successful generation actions, not on every typing change or rerun.",
+        )
+        normalize_cloud_widget_keys(key_prefix)
+        cloud_name = normalize_project_name_from_cloud_widget(key_prefix)
+        force_overwrite = st.checkbox(
+            "Force overwrite if cloud changed / 云端变化时仍覆盖",
+            value=False,
+            key=f"{key_prefix}_force_overwrite",
+            help="Default is safer: if cloud changed after your last save, the app blocks silent overwrite.",
         )
         if st.session_state.get("cloud_last_save_at"):
             st.caption(f"Last cloud save: {st.session_state.cloud_last_save_at}")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("💾 Save to cloud", use_container_width=True, key=f"{key_prefix}_save_btn"):
+            save_disabled = bool(st.session_state.get("ai_running") or st.session_state.get("cloud_save_running"))
+            if st.button("💾 Save to cloud", use_container_width=True, key=f"{key_prefix}_save_btn", disabled=save_disabled):
                 try:
                     with st.spinner("Saving to cloud..."):
-                        saved = cloud_save_project(username, cloud_name)
+                        saved = cloud_save_project_guarded(username, cloud_name, force=force_overwrite, save_reason="manual save")
                     updated = saved.get("updated_at", "") if isinstance(saved, dict) else ""
-                    stamp = updated[:19].replace("T", " ") if updated else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    st.session_state.cloud_last_save_at = stamp
-                    st.session_state.cloud_last_save_status = "success"
+                    stamp = updated[:19].replace("T", " ") if updated else st.session_state.get("cloud_last_save_at", "")
                     st.session_state.cloud_last_summary = f"Saved '{cloud_name}' to cloud." + (f" Updated: {stamp}" if stamp else "")
                     st.success(st.session_state.cloud_last_summary)
                 except Exception as exc:
                     st.error(f"Cloud save failed: {exc}")
+            if save_disabled:
+                st.caption("Save is locked while AI is generating or another save is running.")
         with c2:
             if st.button("🔄 Refresh list", use_container_width=True, key=f"{key_prefix}_refresh_btn"):
                 st.session_state["_cloud_project_list_nonce"] = time.time()
@@ -863,19 +1229,29 @@ def render_cloud_projects_panel(key_prefix: str = "cloud") -> None:
 
         if st.session_state.get("cloud_last_summary"):
             st.caption(st.session_state.cloud_last_summary)
+        if st.session_state.get("cloud_snapshot_status"):
+            st.caption("Snapshot: " + str(st.session_state.cloud_snapshot_status))
 
         if not projects:
             st.info("No cloud projects yet for this login. Click Save to cloud first.")
             return
 
+        st.caption(f"Loaded {len(projects)} cloud project record(s) for user: {username}")
+
         labels = []
         label_to_project: dict[str, dict] = {}
+        seen_labels: dict[str, int] = {}
         for item in projects:
             name = item.get("project_name", "Untitled")
             title = item.get("novel_title") or name
             stage = item.get("current_stage", "?")
             updated = item.get("updated_at", "")
-            label = f"{name} | 《{title}》 | Stage {stage} | {updated[:19].replace('T', ' ')}"
+            row_id = str(item.get("id", ""))
+            short_id = row_id[:8] if row_id else "no-id"
+            base_label = f"{name} | 《{title}》 | Stage {stage} | {updated[:19].replace('T', ' ')} | id:{short_id}"
+            duplicate_count = seen_labels.get(base_label, 0)
+            seen_labels[base_label] = duplicate_count + 1
+            label = base_label if duplicate_count == 0 else f"{base_label} | duplicate:{duplicate_count + 1}"
             labels.append(label)
             label_to_project[label] = item
 
@@ -903,6 +1279,60 @@ def render_cloud_projects_panel(key_prefix: str = "cloud") -> None:
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Cloud delete failed: {exc}")
+
+        selected_project_name = str(label_to_project[selected].get("project_name", ""))
+        with st.expander("🕘 History / Restore cloud snapshots", expanded=False):
+            st.caption("Shows saved snapshots from novel_project_snapshots. If this table is missing, create it in Supabase first.")
+            try:
+                snapshots = cloud_list_project_snapshots(username, selected_project_name, limit=30)
+            except Exception as exc:
+                st.warning(f"Could not list snapshots: {exc}")
+                st.code(
+                    """create table if not exists novel_project_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  username text not null,
+  project_name text not null,
+  novel_title text,
+  current_stage int,
+  save_reason text,
+  project_hash text,
+  project_data jsonb not null,
+  saved_at timestamptz default now()
+);
+
+create index if not exists idx_snapshots_user_project_time
+on novel_project_snapshots (username, project_name, saved_at desc);""",
+                    language="sql",
+                )
+                snapshots = []
+            if not snapshots:
+                st.info("No snapshots yet for this project. Save to cloud once after creating the snapshots table.")
+            else:
+                labels2 = []
+                label_to_snapshot = {}
+                for snap in snapshots:
+                    saved_at = str(snap.get("saved_at", ""))[:19].replace("T", " ")
+                    stage = snap.get("current_stage", "?")
+                    reason = snap.get("save_reason") or "save"
+                    label = f"{saved_at} | Stage {stage} | {reason}"
+                    labels2.append(label)
+                    label_to_snapshot[label] = snap
+                selected_snapshot_label = st.selectbox("Saved snapshots", labels2, key=f"{key_prefix}_snapshot_select")
+                snap = label_to_snapshot[selected_snapshot_label]
+                st.caption(f"Hash: {snap.get('project_hash', '')}")
+                restore_col, copy_col = st.columns(2)
+                with restore_col:
+                    if st.button("Restore snapshot to current session", use_container_width=True, key=f"{key_prefix}_restore_snapshot"):
+                        try:
+                            data = cloud_load_project_snapshot(str(snap.get("id")))
+                            load_project(data)
+                            st.session_state.last_checkpoint_summary = loaded_project_summary() + " Restored from snapshot; Save to cloud to make it latest."
+                            st.success(st.session_state.last_checkpoint_summary)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Snapshot restore failed: {exc}")
+                with copy_col:
+                    st.caption("After restore, use Save as new copy if you want to keep both current and restored versions.")
 
 
 def safe_filename(name: str) -> str:
@@ -993,11 +1423,23 @@ def parse_chapters(outline_text: str) -> list[dict]:
         r"^([一二两三四五六七八九十百]+)\s*[、\.．)]\s*(.+?)(?:\s*[—–-]\s*(.+))?$",
     ]
 
+    skip_foreshadowing_section = False
     for raw_line in lines:
-        clean = raw_line.strip()
+        raw_clean = raw_line.strip()
+        is_markdown_heading = bool(re.match(r"^\s{0,4}#{1,6}\s+", raw_clean))
+        clean = raw_clean
         if not clean:
             continue
         clean = re.sub(r"^\s{0,4}(#{1,6})\s*", "", clean).strip()
+        heading_plain = re.sub(r"\*\*|__|`", "", clean).strip()
+        if is_markdown_heading and re.match(r"^(Foreshadowing|Foreshadowing\s+Map|伏笔|线索|线索回收)", heading_plain, re.I):
+            skip_foreshadowing_section = True
+            continue
+        if is_markdown_heading and re.match(r"^(Chapter\s+Outline|章节大纲)", heading_plain, re.I):
+            skip_foreshadowing_section = False
+            continue
+        if skip_foreshadowing_section:
+            continue
         clean = re.sub(r"^[-*+]\s+", "", clean).strip()
         clean = re.sub(r"\*\*|__|`", "", clean).strip()
         clean = clean.strip(" ")
@@ -1443,6 +1885,7 @@ def render_generate_full_text_panel(location_key: str, default_length_label: str
                             push_version(chapter_idx, st.session_state.chapter_drafts[chapter_idx], "Before one-click full generation")
                         st.session_state.chapter_drafts[chapter_idx] = result
                         rebuild_full_draft()
+                        mark_dirty()
                         cloud_auto_save(f"one-click draft {chapter_heading(ch)}")
                     progress.progress(n / len(targets))
                 status.success("本轮全文生成/补齐完成。可再次点击继续生成剩余章节。")
@@ -1527,6 +1970,138 @@ Return only the refined passage. Preserve names, clues, legal evidence, ability 
             if st.button("丢弃局部精修稿", key=f"local_discard_{location_key}"):
                 st.session_state.local_refinements.pop(chapter_idx, None)
                 st.rerun()
+
+
+def render_batch_revision_panel(location_key: str) -> None:
+    """Batch full-draft revision proposals, chapter by chapter, without overwriting originals."""
+    with st.expander("🔁 全篇批量修改提案 / Batch full-draft revision", expanded=True):
+        if not st.session_state.get("chapter_drafts"):
+            st.info("当前还没有已保存的章节正文。请先生成至少一章，或点击上面的“一键生成 / 补齐全文”。")
+            return
+        st.caption("安全模式：逐章生成修改提案，不直接覆盖原文。你可以逐章接受，或一键接受全部提案。")
+        mode = st.selectbox(
+            "全篇修改目标",
+            [
+                "全篇去 AI 味但保留剧情",
+                "全篇增强爽文节奏",
+                "全篇增强女频情绪张力",
+                "全篇统一古风语气",
+                "全篇减少解释，增加动作和对白",
+                "全篇增强断章钩子",
+                "自定义",
+            ],
+            key=f"batch_mode_{location_key}",
+        )
+        extra = st.text_area("全篇修改补充要求", height=90, key=f"batch_extra_{location_key}", placeholder="例如：保留设定和伏笔；不要改变人物关系；只改节奏和语言。")
+        drafted_indices = sorted([i for i in st.session_state.chapter_drafts.keys() if st.session_state.chapter_drafts.get(i)])
+        selected = st.multiselect(
+            "选择要生成提案的章节",
+            drafted_indices,
+            default=drafted_indices[: min(5, len(drafted_indices))],
+            format_func=lambda i: chapter_heading(st.session_state.chapters[i]) if i < len(st.session_state.chapters) else f"Chapter {i+1}",
+            key=f"batch_selected_{location_key}",
+        )
+        overwrite_existing = st.checkbox("重新生成已有提案", value=False, key=f"batch_overwrite_{location_key}")
+        if st.button("生成全篇逐章修改提案 ✨", type="primary", use_container_width=True, key=f"batch_generate_{location_key}"):
+            if not selected:
+                st.error("请至少选择一章。")
+            else:
+                progress = st.progress(0)
+                status = st.empty()
+                for n, idx in enumerate(selected, 1):
+                    if (not overwrite_existing) and st.session_state.batch_revision_proposals.get(idx):
+                        progress.progress(n / len(selected))
+                        continue
+                    ch = st.session_state.chapters[idx] if idx < len(st.session_state.chapters) else {"num": idx+1, "title": f"Chapter {idx+1}", "summary": ""}
+                    draft = st.session_state.chapter_drafts.get(idx, "")
+                    status.info(f"正在生成提案 {n}/{len(selected)}：{chapter_heading(ch) if idx < len(st.session_state.chapters) else idx+1}")
+                    placeholder = st.empty()
+                    result = generate_text(
+                        system="You are a careful fiction editor. Revise one chapter while preserving plot facts, continuity, names, clues, and chapter meaning. Return only the revised chapter.",
+                        user=f"""Writing context:
+{writing_context()}
+
+Full outline:
+{st.session_state.outline[:5000]}
+
+Chapter:
+{chapter_heading(ch) if idx < len(st.session_state.chapters) else f'Chapter {idx+1}'}
+
+Batch revision goal: {mode}
+Extra instruction: {extra or 'None'}
+
+Original chapter draft:
+{draft}
+
+Return only the revised chapter text. Do not include notes, analysis, or headings unless the original chapter already has a heading.
+""",
+                        placeholder=placeholder,
+                        max_tokens=6500,
+                        cleaner=clean_chapter_draft_output,
+                        task_name=f"Batch revision {idx+1}",
+                    )
+                    if result:
+                        st.session_state.batch_revision_proposals[idx] = {
+                            "time": datetime.now().isoformat(timespec="seconds"),
+                            "mode": mode,
+                            "extra": extra,
+                            "original": draft,
+                            "proposal": result,
+                        }
+                        mark_dirty()
+                    progress.progress(n / len(selected))
+                status.success("批量修改提案已生成。原文未被覆盖。")
+                cloud_auto_save("batch revision proposals")
+                st.rerun()
+
+        proposals = st.session_state.get("batch_revision_proposals", {}) or {}
+        if proposals:
+            st.markdown("### 已生成的全篇修改提案")
+            a, b = st.columns(2)
+            with a:
+                if st.button("接受全部提案", type="primary", use_container_width=True, key=f"batch_accept_all_{location_key}"):
+                    for idx, item in list(proposals.items()):
+                        current = st.session_state.chapter_drafts.get(idx, "")
+                        push_version(idx, current, "Before accepted batch revision")
+                        st.session_state.chapter_drafts[idx] = item.get("proposal", "")
+                    st.session_state.batch_revision_proposals = {}
+                    rebuild_full_draft()
+                    mark_dirty()
+                    cloud_auto_save("accepted all batch revisions")
+                    st.success("已接受全部提案。")
+                    st.rerun()
+            with b:
+                if st.button("清空全部提案", use_container_width=True, key=f"batch_clear_all_{location_key}"):
+                    st.session_state.batch_revision_proposals = {}
+                    mark_dirty()
+                    st.rerun()
+            for idx in sorted(proposals.keys()):
+                item = proposals[idx]
+                label = chapter_heading(st.session_state.chapters[idx]) if idx < len(st.session_state.chapters) else f"Chapter {idx+1}"
+                with st.expander(f"{label} — {item.get('mode', '')}"):
+                    left, right = st.columns(2)
+                    with left:
+                        st.markdown("**原文**")
+                        st.text_area("Original", value=item.get("original", ""), height=260, key=f"batch_orig_{location_key}_{idx}")
+                    with right:
+                        st.markdown("**修改提案**")
+                        st.text_area("Proposal", value=item.get("proposal", ""), height=260, key=f"batch_prop_{location_key}_{idx}")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("接受这一章", type="primary", key=f"batch_accept_{location_key}_{idx}"):
+                            current = st.session_state.chapter_drafts.get(idx, "")
+                            push_version(idx, current, "Before accepted batch revision")
+                            st.session_state.chapter_drafts[idx] = item.get("proposal", "")
+                            st.session_state.batch_revision_proposals.pop(idx, None)
+                            rebuild_full_draft()
+                            mark_dirty()
+                            cloud_auto_save(f"accepted batch revision {label}")
+                            st.rerun()
+                    with c2:
+                        if st.button("放弃这一章提案", key=f"batch_discard_{location_key}_{idx}"):
+                            st.session_state.batch_revision_proposals.pop(idx, None)
+                            mark_dirty()
+                            st.rerun()
 
 
 def _score_source_text(score_target: str, chapter_idx: int | None = None) -> tuple[str, str]:
@@ -1736,6 +2311,7 @@ def _configured_users() -> dict[str, str]:
 
 def require_login() -> None:
     """Protect the Streamlit app with username/password login for multiple users."""
+    restore_login_from_query_token()
     users = _configured_users()
 
     if not users:
@@ -1767,6 +2343,7 @@ BIGMODEL_API_KEY = "your-bigmodel-key"
             if st.button("Log out", use_container_width=True):
                 st.session_state.auth_ok = False
                 st.session_state.auth_user = ""
+                clear_login_query_token()
                 st.rerun()
         return
 
@@ -1784,6 +2361,10 @@ BIGMODEL_API_KEY = "your-bigmodel-key"
         if expected_password and entered_password == expected_password:
             st.session_state.auth_ok = True
             st.session_state.auth_user = username
+            try:
+                st.query_params["auth"] = make_auth_token(username)
+            except Exception:
+                pass
             st.rerun()
         else:
             st.error("Invalid username or password.")
@@ -1792,6 +2373,94 @@ BIGMODEL_API_KEY = "your-bigmodel-key"
 
 
 require_login()
+render_status_bar()
+
+
+# =============================================================================
+# Responsive UI helpers: desktop + mobile writing mode
+# =============================================================================
+def current_view_mode() -> str:
+    mode = st.session_state.get("view_mode", "Auto")
+    if mode not in ["Auto", "Desktop", "Mobile"]:
+        mode = "Auto"
+    return mode
+
+
+def is_mobile_mode() -> bool:
+    # Streamlit cannot reliably know browser width without a custom component.
+    # Auto keeps desktop layout by default; users can switch Mobile manually on phones.
+    return current_view_mode() == "Mobile"
+
+
+def ui_height(desktop: int, mobile: int | None = None) -> int:
+    return mobile if is_mobile_mode() and mobile is not None else desktop
+
+
+def mobile_stage_map() -> list[tuple[str, int]]:
+    return [
+        ("Project", 1),
+        ("World", 2),
+        ("Outline", 3),
+        ("Write", 5),
+        ("Edit", 6),
+        ("Export", 10),
+    ]
+
+
+def render_mobile_top_nav() -> None:
+    if not is_mobile_mode():
+        return
+    st.markdown('<div class="mobile-card">', unsafe_allow_html=True)
+    st.markdown("**Mobile writing mode / 手机写作模式**")
+    labels = [x[0] for x in mobile_stage_map()]
+    stage_by_label = dict(mobile_stage_map())
+    current = next((label for label, stage in mobile_stage_map() if stage == st.session_state.get("stage")), "Write")
+    selected = st.radio(
+        "Quick navigation",
+        labels,
+        index=labels.index(current) if current in labels else 3,
+        horizontal=True,
+        label_visibility="collapsed",
+        disabled=bool(st.session_state.get("ai_running")),
+        key="mobile_top_nav_radio",
+    )
+    target_stage = stage_by_label.get(selected, st.session_state.get("stage", 5))
+    if target_stage != st.session_state.get("stage"):
+        st.session_state.stage = target_stage
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_mobile_dashboard() -> None:
+    if not is_mobile_mode():
+        return
+    title = st.session_state.get("novel_title") or "Untitled"
+    project = default_cloud_project_name()
+    stage = int(st.session_state.get("stage", 1) or 1)
+    drafts = st.session_state.get("chapter_drafts") or {}
+    chapters = st.session_state.get("chapters") or []
+    last_saved = st.session_state.get("cloud_last_save_at") or "not saved in this session"
+    st.markdown('<div class="mobile-card">', unsafe_allow_html=True)
+    st.markdown(f'<div class="mobile-title">《{title}》</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="mobile-kpi">Project: {project} · Stage {stage} · Drafted chapters: {len(drafts)}/{len(chapters)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="mobile-kpi">Last cloud save: {last_saved}</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("✍️ Write", use_container_width=True, disabled=bool(st.session_state.get("ai_running")), key="mobile_dash_write"):
+            st.session_state.stage = 5
+            st.rerun()
+    with c2:
+        if st.button("💾 Save", use_container_width=True, disabled=bool(st.session_state.get("ai_running")), key="mobile_dash_save"):
+            try:
+                cloud_save_project_guarded(st.session_state.get("auth_user", "user"), project, force=True, save_reason="mobile quick save")
+                st.success("Saved to cloud.")
+            except Exception as exc:
+                st.error(f"Cloud save failed: {exc}")
+    with c3:
+        if st.button("📥 Export", use_container_width=True, disabled=bool(st.session_state.get("ai_running")), key="mobile_dash_export"):
+            st.session_state.stage = 10
+            st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # =============================================================================
 # Sidebar
@@ -1812,6 +2481,13 @@ STAGES = [
 with st.sidebar:
     st.markdown("## 📖 AI Novel Studio")
     st.caption("Gemini first → BigModel/Zhipu fallback")
+    st.radio(
+        "View mode / 显示模式",
+        ["Auto", "Desktop", "Mobile"],
+        key="view_mode",
+        horizontal=True,
+        help="Mobile mode simplifies navigation and writing controls. Auto keeps the full desktop workspace.",
+    )
     gemini_key = get_gemini_api_key()
     bigmodel_key = get_bigmodel_api_key()
     if gemini_key and bigmodel_key:
@@ -1840,12 +2516,22 @@ with st.sidebar:
     st.markdown("---")
     for i, (icon, label) in enumerate(STAGES, 1):
         btn_type = "primary" if st.session_state.stage == i else "secondary"
-        if st.button(f"{icon} {i}. {label}", use_container_width=True, type=btn_type):
+        if st.button(
+            f"{icon} {i}. {label}",
+            use_container_width=True,
+            type=btn_type,
+            disabled=bool(st.session_state.get("ai_running")),
+            help="AI is running. Wait until the current generation finishes." if st.session_state.get("ai_running") else None,
+        ):
             st.session_state.stage = i
             st.rerun()
     st.markdown("---")
     st.caption(f"Project: {st.session_state.project_name}")
-    render_cloud_projects_panel("sidebar_cloud")
+    if is_mobile_mode():
+        with st.expander("Cloud projects / 云端项目", expanded=False):
+            render_cloud_projects_panel("sidebar_cloud")
+    else:
+        render_cloud_projects_panel("sidebar_cloud")
 
     # Persistent checkpoint: available from every phase.
     # This lets the author save the exact current state, upload later,
@@ -1896,6 +2582,9 @@ with st.sidebar:
             except Exception as exc:
                 st.error(f"Could not load checkpoint: {exc}")
 
+render_mobile_top_nav()
+render_mobile_dashboard()
+
 # =============================================================================
 # Stage 1: Project Setup
 # =============================================================================
@@ -1908,83 +2597,98 @@ if st.session_state.stage == 1:
     with tab_new:
         col1, col2 = st.columns(2)
         with col1:
-            st.session_state.project_name = st.text_input("Project file name", value=st.session_state.project_name)
-            st.session_state.novel_title = st.text_input("Novel title / 书名", value=st.session_state.novel_title)
+            normalize_widget_defaults()
+            st.text_input("Project file name", key="project_name", on_change=mark_dirty)
+            st.text_input("Novel title / 书名", key="novel_title", on_change=mark_dirty)
             languages = ["Chinese 中文", "English", "Bilingual 中英双语"]
-            st.session_state.language = st.selectbox("Writing language", languages, index=languages.index(st.session_state.language))
+            st.selectbox("Writing language", languages, key="language", on_change=mark_dirty)
             audience_options = ["女频", "男频", "通用/无固定频道"]
-            st.session_state.audience_channel = st.radio(
+            st.radio(
                 "频道方向 / Audience",
                 audience_options,
-                index=audience_options.index(st.session_state.audience_channel) if st.session_state.audience_channel in audience_options else 0,
+                key="audience_channel",
                 horizontal=True,
+                on_change=mark_dirty,
             )
             platform_options = ["起点中文网", "晋江文学城", "番茄小说", "七猫小说", "掌阅", "红袖添香", "潇湘书院", "知乎盐选 / 短篇付费", "飞卢", "刺猬猫 / 轻小说", "自定义/多平台"]
-            st.session_state.publishing_platforms = st.multiselect(
+            selected_list_is_valid("publishing_platforms", platform_options, ["晋江文学城", "番茄小说"])
+            st.multiselect(
                 "目标投稿平台 / Publishing target",
                 platform_options,
-                default=[p for p in st.session_state.publishing_platforms if p in platform_options],
+                key="publishing_platforms",
                 help="建议主选 1 个平台，也可以多选用于比较不同读者口味。",
+                on_change=mark_dirty,
             )
             styles = ["现代网文", "古风/仙侠", "女频仙侠", "玄幻升级流", "悬疑推理", "都市情感", "轻小说", "宫斗权谋", "中式恐怖", "文学感", "自定义"]
-            st.session_state.chinese_style = st.selectbox(
-                "Chinese style preset", styles, index=styles.index(st.session_state.chinese_style) if st.session_state.chinese_style in styles else 0
+            st.selectbox(
+                "Chinese style preset", styles, key="chinese_style", on_change=mark_dirty
             )
         with col2:
             genres = ["Xianxia / 仙侠", "Wuxia / 武侠", "Fantasy", "Science Fiction", "Romance", "Thriller", "Mystery", "Historical Fiction", "Urban Fantasy / 都市异能", "Horror", "Literary Fiction", "Other"]
-            st.session_state.genre = st.selectbox("Primary genre / 主类型", genres, index=genres.index(st.session_state.genre) if st.session_state.genre in genres else 0)
+            normalize_widget_defaults()
+            st.selectbox("Primary genre / 主类型", genres, key="genre", on_change=mark_dirty)
             tag_options = ["重生", "复仇", "末世", "系统", "大女主", "强强", "逆袭", "爽文", "甜宠", "虐恋", "权谋", "宫斗", "悬疑", "刑侦", "法律诉讼", "异能", "修仙", "灵气复苏", "无限流", "穿书", "年代文", "克苏鲁", "种田", "经营", "校园", "娱乐圈"]
-            st.session_state.genre_tags = st.multiselect(
+            selected_list_is_valid("genre_tags", tag_options, ["重生", "复仇", "大女主"])
+            st.multiselect(
                 "可叠加题材标签 / Multi-genre tags",
                 tag_options,
-                default=[tag for tag in st.session_state.genre_tags if tag in tag_options],
+                key="genre_tags",
                 help="例如：重生 + 复仇 + 末世 + 系统 + 大女主",
+                on_change=mark_dirty,
             )
-            st.session_state.custom_genre_tags = st.text_input("Custom tags / 自定义题材", value=st.session_state.custom_genre_tags, placeholder="例如：赛博修仙、律政复仇、末世经营")
+            st.text_input("Custom tags / 自定义题材", key="custom_genre_tags", placeholder="例如：赛博修仙、律政复仇、末世经营", on_change=mark_dirty)
             submission_options = ["长篇连载", "短篇付费", "免费爽文", "签约向商业文", "IP 改编潜力文", "剧情流", "感情流", "升级流", "复仇流", "群像权谋", "单元案件流"]
-            st.session_state.submission_types = st.multiselect(
+            selected_list_is_valid("submission_types", submission_options, ["长篇连载", "签约向商业文"])
+            st.multiselect(
                 "投稿类型 / Article type",
                 submission_options,
-                default=[t for t in st.session_state.submission_types if t in submission_options],
+                key="submission_types",
+                on_change=mark_dirty,
             )
             goal_options = ["前三章留存", "签约通过率", "追读率", "付费转化", "爽点密度", "人物关系张力", "IP潜力", "降低写崩风险"]
-            st.session_state.platform_goals = st.multiselect(
+            selected_list_is_valid("platform_goals", goal_options, ["前三章留存", "签约通过率", "追读率"])
+            st.multiselect(
                 "平台目标 / Strategy goals",
                 goal_options,
-                default=[g for g in st.session_state.platform_goals if g in goal_options],
+                key="platform_goals",
+                on_change=mark_dirty,
             )
             lengths = ["Short story (~5 chapters)", "Novella (~10 chapters)", "Novel (~18 chapters)", "Long web novel (~30 chapters)"]
-            st.session_state.target_length = st.selectbox(
-                "Target length", lengths, index=lengths.index(st.session_state.target_length) if st.session_state.target_length in lengths else 2
+            st.selectbox(
+                "Target length", lengths, key="target_length", on_change=mark_dirty
             )
-            st.session_state.style_note = st.text_input("Style / tone note", value=st.session_state.style_note, placeholder="例如：古风但不堆辞藻，节奏快，对白自然")
+            st.text_input("Style / tone note", key="style_note", placeholder="例如：古风但不堆辞藻，节奏快，对白自然", on_change=mark_dirty)
 
-        st.session_state.story_idea = st.text_area(
+        st.text_area(
             "Story idea / 故事想法",
-            value=st.session_state.story_idea,
-            height=130,
+            key="story_idea",
+            height=ui_height(130, 110),
             placeholder="例如：一个被逐出宗门的少女，在废弃灵矿中发现会说话的古剑……",
+            on_change=mark_dirty,
         )
-        st.session_state.global_instruction = st.text_area(
+        st.text_area(
             "Global writing instruction / 全局写作要求",
-            value=st.session_state.global_instruction,
-            height=90,
+            key="global_instruction",
+            height=ui_height(90, 80),
             placeholder="例如：用中文写作；女主冷静克制；少解释，多用动作和对白推进剧情；避免翻译腔。",
+            on_change=mark_dirty,
         )
-        st.session_state.custom_platform_note = st.text_area(
+        st.text_area(
             "自定义投稿/平台要求",
-            value=st.session_state.custom_platform_note,
+            key="custom_platform_note",
             height=80,
             placeholder="例如：主投番茄，第一章必须重生醒来+立刻危机+小反杀；前三章不要大段设定。",
+            on_change=mark_dirty,
         )
         strategy_preview = platform_strategy_text()
         if strategy_preview:
             with st.expander("查看自动平台策略 / Platform strategy preview", expanded=False):
                 st.markdown(strategy_preview.replace("\n", "  \n"))
-        st.session_state.banned_phrases = st.text_area(
+        st.text_area(
             "Banned / overused phrases to avoid / 避免使用的套话",
-            value=st.session_state.banned_phrases,
-            height=110,
+            key="banned_phrases",
+            height=ui_height(110, 90),
+            on_change=mark_dirty,
         )
         st.info("Recommended workflow: Project Setup → Story Bible → Outline → Chapter Planner → Draft Writer → Revision Studio → Consistency Editor → Polish → Export.")
         if st.button("Save settings and go to Story Bible →", type="primary"):
@@ -2029,17 +2733,18 @@ elif st.session_state.stage == 2:
 
     col1, col2 = st.columns(2)
     with col1:
-        st.session_state.characters = st.text_area("Characters / 人物设定", value=st.session_state.characters, height=220)
-        st.session_state.timeline = st.text_area("Timeline / 时间线", value=st.session_state.timeline, height=180)
+        st.text_area("Characters / 人物设定", key="characters", height=220, on_change=mark_dirty)
+        st.text_area("Timeline / 时间线", key="timeline", height=180, on_change=mark_dirty)
     with col2:
-        st.session_state.worldbuilding = st.text_area("Worldbuilding, rules, factions / 世界观、规则、势力", value=st.session_state.worldbuilding, height=220)
-        st.session_state.glossary = st.text_area("Glossary: names, terms, objects / 术语表", value=st.session_state.glossary, height=180)
+        st.text_area("Worldbuilding, rules, factions / 世界观、规则、势力", key="worldbuilding", height=220, on_change=mark_dirty)
+        st.text_area("Glossary: names, terms, objects / 术语表", key="glossary", height=180, on_change=mark_dirty)
 
-    st.session_state.story_bible = st.text_area(
+    st.text_area(
         "Full Story Bible / 总设定集",
-        value=st.session_state.story_bible,
-        height=220,
+        key="story_bible",
+        height=260,
         placeholder="核心设定、人物关系、伏笔、禁忌、世界规则、写作风格规则……",
+        on_change=mark_dirty,
     )
 
     col_a, col_b = st.columns(2)
@@ -2084,16 +2789,21 @@ Existing glossary:
 ## 必须避免
 """,
                     placeholder=placeholder,
-                    max_tokens=4000,
+                    max_tokens=8000,
+                    task_name="Story Bible generation",
                 )
             if result:
+                st.session_state["_last_story_bible_raw"] = st.session_state.get("_last_ai_raw_output", result)
                 result = clean_story_bible_output(result, st.session_state.novel_title)
                 placeholder.markdown(result)
                 st.session_state.story_bible = result
+                mark_dirty()
+                if story_bible_is_incomplete(result):
+                    st.warning("Story Bible may be incomplete. Use Continue / 补全 below before moving on.")
                 cloud_auto_save("Story Bible generation")
                 st.success("Story Bible updated.")
     with col_b:
-        custom = st.text_area("修改要求（只给 AI 看，不会写入设定集）", height=90, placeholder="例如：增加修炼等级体系；把男主身份隐藏更久；加入三条伏笔。")
+        custom = st.text_area("修改要求（只给 AI 看，不会写入设定集）", height=90, key="story_bible_revision_instruction", placeholder="例如：增加修炼等级体系；把男主身份隐藏更久；加入三条伏笔。")
         if st.button("Revise Story Bible 🔁", use_container_width=True):
             if not st.session_state.story_bible:
                 st.error("Generate or enter a Story Bible first.")
@@ -2116,14 +2826,64 @@ Revision instruction:
 请直接返回修订后的成品设定集。不要显示提示词、分析过程、修改说明或追问。
 """,
                         placeholder=placeholder,
-                        max_tokens=4000,
+                        max_tokens=8000,
+                        task_name="Story Bible revision",
                     )
                 if result:
+                    st.session_state["_last_story_bible_raw"] = st.session_state.get("_last_ai_raw_output", result)
                     result = clean_story_bible_output(result, st.session_state.novel_title)
                     placeholder.markdown(result)
                     st.session_state.story_bible = result
+                    mark_dirty()
+                    if story_bible_is_incomplete(result):
+                        st.warning("Story Bible may be incomplete. Use Continue / 补全 below before moving on.")
                     cloud_auto_save("Story Bible revision")
                     st.success("Story Bible revised.")
+
+    with st.expander("🧯 Story Bible recovery / 补全与恢复", expanded=story_bible_is_incomplete(st.session_state.get("story_bible", ""))):
+        if story_bible_is_incomplete(st.session_state.get("story_bible", "")):
+            st.warning("当前 Story Bible 可能没有生成完整，建议点击补全。")
+        if st.session_state.get("_last_story_bible_raw"):
+            if st.button("Restore last raw AI output / 恢复最近原始输出", use_container_width=True):
+                st.session_state.story_bible = st.session_state.get("_last_story_bible_raw", "")
+                mark_dirty()
+                st.rerun()
+        if st.button("Continue / 补全 Story Bible ✨", type="primary", use_container_width=True):
+            with st.spinner("Continuing Story Bible..."):
+                placeholder = st.empty()
+                result = generate_text(
+                    system="你是资深小说设定架构师。请只补全当前设定集中缺失或过短的部分，不要重写已经完整的部分。",
+                    user=f"""Writing context:
+{writing_context()}
+
+Current Story Bible, possibly incomplete:
+{st.session_state.story_bible}
+
+请补全缺失部分，尤其检查并补全这些章节：
+## 核心前提
+## 主要角色
+## 人物关系
+## 世界法则与力量体系
+## 核心地点与势力
+## 时间线
+## 重要道具 / 线索 / 伏笔
+## 文风准则
+## 必须避免
+
+请返回完整的修订后《故事设定集》，不要输出说明。
+""",
+                    placeholder=placeholder,
+                    max_tokens=8000,
+                    task_name="Story Bible continuation",
+                )
+            if result:
+                st.session_state["_last_story_bible_raw"] = st.session_state.get("_last_ai_raw_output", result)
+                result = clean_story_bible_output(result, st.session_state.novel_title)
+                st.session_state.story_bible = result
+                mark_dirty()
+                cloud_auto_save("Story Bible continuation")
+                st.success("Story Bible continued/completed.")
+                st.rerun()
 
     if st.button("Next: Outline →", type="primary"):
         st.session_state.stage = 3
@@ -2240,6 +3000,7 @@ Required format exactly:
             if result:
                 st.session_state.outline = result
                 st.session_state.chapters = parse_chapters(result)
+                mark_dirty()
                 cloud_auto_save("outline generation")
                 st.session_state["_json_repair_note"] = ""
                 if st.session_state.chapters:
@@ -2256,12 +3017,16 @@ Required format exactly:
     st.divider()
     if st.session_state.get("outline"):
         st.subheader(st.session_state.get("novel_title", "Untitled"))
-        st.markdown(st.session_state.outline)
+        view_tab, raw_tab = st.tabs(["章节分段视图", "原始大纲"] )
+        with view_tab:
+            render_formatted_outline()
+        with raw_tab:
+            st.markdown(st.session_state.outline)
     else:
         st.info("当前还没有大纲。点击 Generate formal outline 或 Build outline locally。")
 
     st.divider()
-    revision = st.text_area("Revise outline instruction", height=90, placeholder="例如：增加反派动机；减少爱情线；每三章有一个小高潮。")
+    revision = st.text_area("Revise outline instruction", height=90, key="outline_revision_instruction", placeholder="例如：增加反派动机；减少爱情线；每三章有一个小高潮。")
     rev_cols = st.columns([0.35, 0.65])
     with rev_cols[0]:
         revise_clicked = st.button("Revise outline 🔁", use_container_width=True, key="outline_revise_v12")
@@ -2295,6 +3060,7 @@ Return the revised outline in this format:
             if result:
                 st.session_state.outline = result
                 st.session_state.chapters = parse_chapters(result)
+                mark_dirty()
                 cloud_auto_save("outline revision")
                 set_last_action(f"Outline revised: {len(st.session_state.chapters)} chapters detected.")
                 st.success(f"Outline revised. {len(st.session_state.chapters)} chapters detected.")
@@ -2407,7 +3173,17 @@ Create a chapter beat sheet with:
     st.markdown(f"**Outline summary:** {ch.get('summary', '')}")
 
     current = st.session_state.chapter_beats.get(idx, "")
-    st.session_state.chapter_beats[idx] = st.text_area("Chapter beat sheet", value=current, height=260, placeholder="POV, location, goal, conflict, reveal, emotional turn, ending hook, must include, must avoid...")
+    beat_key = f"chapter_beat_editor_{idx}"
+    beat_hash_key = f"chapter_beat_editor_hash_{idx}"
+    current_hash = hashlib.md5(current.encode("utf-8")).hexdigest() if current else ""
+    if beat_key not in st.session_state or st.session_state.get(beat_hash_key) != current_hash:
+        st.session_state[beat_key] = current
+        st.session_state[beat_hash_key] = current_hash
+    edited_beat = st.text_area("Chapter beat sheet", key=beat_key, height=ui_height(260, 220), placeholder="POV, location, goal, conflict, reveal, emotional turn, ending hook, must include, must avoid...")
+    if edited_beat != current:
+        st.session_state.chapter_beats[idx] = edited_beat
+        st.session_state[beat_hash_key] = hashlib.md5(edited_beat.encode("utf-8")).hexdigest() if edited_beat else ""
+        mark_dirty()
 
     col1, col2 = st.columns(2)
     with col1:
@@ -2450,7 +3226,7 @@ Create a chapter beat sheet with:
                 st.success("Beat sheet generated.")
                 st.rerun()
     with col2:
-        instruction = st.text_area("Beat revision instruction", height=90, placeholder="例如：结尾更强；增加女主隐藏实力；减少男主出场。")
+        instruction = st.text_area("Beat revision instruction", height=90, key=f"beat_revision_instruction_{idx}", placeholder="例如：结尾更强；增加女主隐藏实力；减少男主出场。")
         if st.button("Revise selected beat sheet 🔁", use_container_width=True):
             if not st.session_state.chapter_beats.get(idx):
                 st.error("Generate or enter a beat sheet first.")
@@ -2490,6 +3266,8 @@ Return the revised beat sheet.
 # =============================================================================
 elif st.session_state.stage == 5:
     st.markdown('<div class="stage-header">✍️ Draft Writer / 章节写作</div>', unsafe_allow_html=True)
+    if is_mobile_mode():
+        st.info("Mobile mode: 当前页优先用于继续写、改当前章、快速保存。复杂设定建议回电脑端处理。")
     st.markdown('<div class="stage-desc">Draft chapters from outline + Story Bible + beat sheet. Revisions are proposed side-by-side before acceptance.</div>', unsafe_allow_html=True)
 
     if not st.session_state.chapters:
@@ -2526,13 +3304,28 @@ elif st.session_state.stage == 5:
                 push_version(idx, st.session_state.chapter_drafts[idx], "Before new draft")
             st.session_state.chapter_drafts[idx] = result
             rebuild_full_draft()
+            mark_dirty()
             cloud_auto_save(f"draft {chapter_heading(ch)}")
             st.success("Chapter drafted.")
             st.rerun()
 
     if st.session_state.chapter_drafts.get(idx):
         st.subheader("Current draft")
-        st.text_area("Draft text", value=st.session_state.chapter_drafts[idx], height=360, key=f"draft_view_{idx}")
+        draft_key = f"draft_editor_{idx}"
+        draft_hash_key = f"draft_editor_hash_{idx}"
+        current_draft = st.session_state.chapter_drafts[idx]
+        current_draft_hash = hashlib.md5(current_draft.encode("utf-8")).hexdigest() if current_draft else ""
+        if draft_key not in st.session_state or st.session_state.get(draft_hash_key) != current_draft_hash:
+            st.session_state[draft_key] = current_draft
+            st.session_state[draft_hash_key] = current_draft_hash
+        edited_draft = st.text_area("Draft text", key=draft_key, height=ui_height(360, 280))
+        if edited_draft != current_draft:
+            st.info("Draft has local edits. They are saved into this project state automatically; use cloud save to persist them online.")
+            st.session_state.chapter_drafts[idx] = edited_draft
+            st.session_state[draft_hash_key] = hashlib.md5(edited_draft.encode("utf-8")).hexdigest() if edited_draft else ""
+            rebuild_full_draft()
+            mark_dirty()
+        render_batch_revision_panel("draft_writer_current")
         render_local_refinement_panel(idx, st.session_state.chapter_drafts[idx], f"draft_{idx}")
         with st.expander("📊 给当前章节打分 / Quick market score", expanded=False):
             render_market_review_controls(f"draft_quick_{idx}", compact=True, chapter_idx=idx)
@@ -2543,7 +3336,7 @@ elif st.session_state.stage == 5:
             "Make prose less AI-like", "Increase emotional tension", "Add sensory detail", "Reduce exposition",
             "Add conflict", "Make ending stronger", "Rewrite in 古风 tone",
         ])
-        custom = st.text_area("Additional revision instruction", height=90, placeholder="例如：让女主少说话，用动作表现她的防备。")
+        custom = st.text_area("Additional revision instruction", height=90, key=f"draft_revision_instruction_{idx}", placeholder="例如：让女主少说话，用动作表现她的防备。")
         if st.button("Create revision proposal 🔁"):
             instruction = revision_prompt_for_mode(mode, custom)
             with st.spinner("Creating revision proposal..."):
@@ -2622,7 +3415,20 @@ elif st.session_state.stage == 6:
     draft = st.session_state.chapter_drafts[idx]
     render_quick_reference(idx)
     render_generate_full_text_panel("revision_studio")
-    st.text_area("Current chapter draft", value=draft, height=320, key=f"revision_current_{idx}")
+    render_batch_revision_panel("revision_studio")
+    rev_draft_key = f"revision_current_editor_{idx}"
+    rev_hash_key = f"revision_current_hash_{idx}"
+    draft_hash = hashlib.md5(draft.encode("utf-8")).hexdigest() if draft else ""
+    if rev_draft_key not in st.session_state or st.session_state.get(rev_hash_key) != draft_hash:
+        st.session_state[rev_draft_key] = draft
+        st.session_state[rev_hash_key] = draft_hash
+    edited_revision_draft = st.text_area("Current chapter draft", key=rev_draft_key, height=ui_height(320, 260))
+    if edited_revision_draft != draft:
+        st.session_state.chapter_drafts[idx] = edited_revision_draft
+        st.session_state[rev_hash_key] = hashlib.md5(edited_revision_draft.encode("utf-8")).hexdigest() if edited_revision_draft else ""
+        rebuild_full_draft()
+        mark_dirty()
+        draft = edited_revision_draft
 
     tab_continue, tab_local, tab_quality, tab_versions = st.tabs(["Continue / Rewrite", "局部点杀精修", "Quality Score", "Version History"])
     with tab_continue:
@@ -2921,10 +3727,11 @@ elif st.session_state.stage == 10:
         if use_polished and st.session_state.polished_draft:
             return st.session_state.polished_draft.strip()
         ordered = []
-        for idx, chapter in enumerate(st.session_state.chapters, start=1):
-            draft = (st.session_state.chapter_drafts or {}).get(idx, "")
+        for zero_idx, chapter in enumerate(st.session_state.chapters):
+            draft = (st.session_state.chapter_drafts or {}).get(zero_idx, "")
             if draft and draft.strip():
-                title = chapter.get("title", f"第{idx}章") if isinstance(chapter, dict) else f"第{idx}章"
+                one_idx = zero_idx + 1
+                title = chapter.get("title", f"第{one_idx}章") if isinstance(chapter, dict) else f"第{one_idx}章"
                 ordered.append(f"{title}\n\n{draft.strip()}")
         if ordered:
             return "\n\n".join(ordered).strip()
